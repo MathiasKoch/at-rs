@@ -176,6 +176,27 @@ where
 {
 }
 
+impl<L> AtatResp for heapless::String<L> where L: ArrayLength<u8> {}
+
+impl<L> AtatCmd for heapless::String<L>
+where
+    L: ArrayLength<u8>,
+{
+    type CommandLen = L;
+
+    type Response = heapless::String<heapless::consts::U256>;
+
+    fn as_bytes(&self) -> Vec<u8, Self::CommandLen> {
+        self.clone().into_bytes()
+    }
+
+    fn parse(&self, resp: &[u8]) -> Result<Self::Response, Error> {
+        heapless::String::from_utf8(
+            Vec::from_slice(resp).map_err(|_| Error::ParseString)?,
+        ).map_err(|_| Error::ParseString)
+    }
+}
+
 #[cfg(all(test, feature = "derive"))]
 mod test {
     use super::*;

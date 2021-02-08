@@ -438,7 +438,6 @@ where
     /// This function should be called regularly for the ingress manager to work
     pub fn digest(&mut self) {
         // Handle commands
-        self.handle_com();
 
         // Trim leading whitespace
         if self.buf.starts_with(&[self.line_term_char]) || self.buf.starts_with(&[self.format_char])
@@ -618,6 +617,7 @@ where
                 self.state = State::Idle;
             }
         }
+        self.handle_com();
     }
 }
 

@@ -6,7 +6,6 @@ target/
 *.o
 application/Debug/bin/
 application/Debug/obj/
-.vscode
 lcov.info
 
 # Ignore lock file in libraries (https://doc.rust-lang.org/cargo/faq.html#why-do-binaries-have-cargolock-in-version-control-but-not-libraries)

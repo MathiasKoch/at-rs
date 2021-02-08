@@ -239,8 +239,11 @@ mod ingress_manager;
 mod queues;
 mod traits;
 
+use core::convert::TryInto;
+
 #[cfg(feature = "derive")]
 pub use atat_derive;
+use embedded_time::{Clock, duration::*};
 
 #[cfg(feature = "derive")]
 pub mod derive;
@@ -389,7 +392,7 @@ pub struct Config {
     line_term_char: u8,
     format_char: u8,
     at_echo_enabled: bool,
-    cmd_cooldown: u32,
+    cmd_cooldown: Milliseconds<u32>,
 }
 
 impl Default for Config {
@@ -399,7 +402,7 @@ impl Default for Config {
             line_term_char: b'\r',
             format_char: b'\n',
             at_echo_enabled: true,
-            cmd_cooldown: 20,
+            cmd_cooldown: Milliseconds(20),
         }
     }
 }
@@ -432,14 +435,14 @@ impl Config {
     }
 
     #[must_use]
-    pub const fn cmd_cooldown(mut self, ms: u32) -> Self {
+    pub const fn cmd_cooldown(mut self, ms: Milliseconds<u32>) -> Self {
         self.cmd_cooldown = ms;
         self
     }
 }
 
-type ClientParser<Tx, T, U, BufLen, ComCapacity, ResCapacity, UrcCapacity> = (
-    Client<Tx, T, BufLen, ComCapacity, ResCapacity, UrcCapacity>,
+type ClientParser<Tx, CLK, U, BufLen, ComCapacity, ResCapacity, UrcCapacity> = (
+    Client<Tx, CLK, BufLen, ComCapacity, ResCapacity, UrcCapacity>,
     IngressManager<BufLen, U, ComCapacity, ResCapacity, UrcCapacity>,
 );
 
@@ -468,21 +471,21 @@ where
 /// [`Client`]: struct.Client.html
 /// [`IngressManager`]: struct.IngressManager.html
 /// [`new`]: #method.new
-pub struct ClientBuilder<Tx, T, U, BufLen, ComCapacity, ResCapacity, UrcCapacity> {
+pub struct ClientBuilder<Tx, CLK, U, BufLen, ComCapacity, ResCapacity, UrcCapacity> {
     serial_tx: Tx,
-    timer: T,
+    clock: CLK,
     config: Config,
     custom_urc_matcher: Option<U>,
     #[doc(hidden)]
     _internal: core::marker::PhantomData<(BufLen, ComCapacity, ResCapacity, UrcCapacity)>,
 }
 
-impl<Tx, T, U, BufLen, ComCapacity, ResCapacity, UrcCapacity>
-    ClientBuilder<Tx, T, U, BufLen, ComCapacity, ResCapacity, UrcCapacity>
+impl<Tx, CLK, U, BufLen, ComCapacity, ResCapacity, UrcCapacity>
+    ClientBuilder<Tx, CLK, U, BufLen, ComCapacity, ResCapacity, UrcCapacity>
 where
     Tx: embedded_hal::serial::Write<u8>,
-    T: embedded_hal::timer::CountDown,
-    T::Time: From<u32>,
+    CLK: Clock,
+    Generic<CLK::T>: TryInto<Milliseconds>,
     U: UrcMatcher<BufLen>,
     BufLen: ArrayLength<u8>,
     ComCapacity: ArrayLength<ComItem>,
@@ -497,10 +500,10 @@ where
     ///
     /// [serialwrite]: ../embedded_hal/serial/trait.Write.html
     /// [timercountdown]: ../embedded_hal/timer/trait.CountDown.html
-    pub fn new(serial_tx: Tx, timer: T, config: Config) -> Self {
+    pub fn new(serial_tx: Tx, clock: CLK, config: Config) -> Self {
         Self {
             serial_tx,
-            timer,
+            clock,
             config,
             custom_urc_matcher: None,
             #[doc(hidden)]
@@ -523,7 +526,7 @@ where
     pub fn build(
         self,
         queues: Queues<BufLen, ComCapacity, ResCapacity, UrcCapacity>,
-    ) -> ClientParser<Tx, T, U, BufLen, ComCapacity, ResCapacity, UrcCapacity> {
+    ) -> ClientParser<Tx, CLK, U, BufLen, ComCapacity, ResCapacity, UrcCapacity> {
         let parser = IngressManager::with_custom_urc_matcher(
             queues.res_queue.0,
             queues.urc_queue.0,
@@ -536,7 +539,7 @@ where
             queues.res_queue.1,
             queues.urc_queue.1,
             queues.com_queue.0,
-            self.timer,
+            self.clock,
             self.config,
         );
 

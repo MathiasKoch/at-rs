@@ -1,4 +1,7 @@
-use embedded_hal::{serial, timer::CountDown};
+use core::convert::TryInto;
+
+use embedded_hal::serial;
+use embedded_time::{duration::*, Clock, Instant};
 
 use crate::atat_log;
 use crate::error::Error;
@@ -20,14 +23,15 @@ enum ClientState {
 /// `clearBuffer` to the ingress-manager.
 pub struct Client<
     Tx,
-    T,
+    CLK,
     BufLen = consts::U256,
     ComCapacity = consts::U3,
     ResCapacity = consts::U5,
     UrcCapacity = consts::U10,
 > where
     Tx: serial::Write<u8>,
-    T: CountDown,
+    CLK: Clock,
+    Generic<CLK::T>: TryInto<Milliseconds>,
     BufLen: ArrayLength<u8>,
     ComCapacity: ArrayLength<ComItem>,
     ResCapacity: ArrayLength<ResItem<BufLen>>,
@@ -43,17 +47,20 @@ pub struct Client<
     /// The command producer can send commands to the ingress manager
     com_p: ComProducer<ComCapacity>,
 
+    last_receive_time: Instant<CLK>,
+    cmd_send_time: Option<Instant<CLK>>,
+
     state: ClientState,
-    timer: T,
+    clock: CLK,
     config: Config,
 }
 
-impl<Tx, T, BufLen, ComCapacity, ResCapacity, UrcCapacity>
-    Client<Tx, T, BufLen, ComCapacity, ResCapacity, UrcCapacity>
+impl<Tx, CLK, BufLen, ComCapacity, ResCapacity, UrcCapacity>
+    Client<Tx, CLK, BufLen, ComCapacity, ResCapacity, UrcCapacity>
 where
     Tx: serial::Write<u8>,
-    T: CountDown,
-    T::Time: From<u32>,
+    CLK: Clock,
+    Generic<CLK::T>: TryInto<Milliseconds>,
     BufLen: ArrayLength<u8>,
     ComCapacity: ArrayLength<ComItem>,
     ResCapacity: ArrayLength<ResItem<BufLen>>,
@@ -64,27 +71,65 @@ where
         res_c: ResConsumer<BufLen, ResCapacity>,
         urc_c: UrcConsumer<BufLen, UrcCapacity>,
         com_p: ComProducer<ComCapacity>,
-        timer: T,
+        clock: CLK,
         config: Config,
     ) -> Self {
+        let last_receive_time = clock
+            .try_now()
+            .map_err(|_| defmt::error!("Failed to obtain initial clock!"))
+            .unwrap();
+
         Self {
+            last_receive_time,
+            cmd_send_time: None,
             tx,
             res_c,
             urc_c,
             com_p,
             state: ClientState::Idle,
             config,
-            timer,
+            clock,
         }
+    }
+
+    fn set_last_receive_time(&mut self) -> Result<(), Error> {
+        self.last_receive_time = self.clock.try_now().map_err(|_| Error::Overflow)?;
+        Ok(())
+    }
+
+    fn set_cmd_send_time(&mut self) -> Result<(), Error> {
+        self.cmd_send_time = Some(self.clock.try_now().map_err(|_| Error::Overflow)?);
+        Ok(())
+    }
+
+    fn last_receive_elapsed(&self) -> Milliseconds<u32> {
+        self.clock
+            .try_now()
+            .ok()
+            .and_then(|now| now.checked_duration_since(&self.last_receive_time))
+            .and_then(|dur| dur.try_into().ok())
+            .unwrap_or_else(|| Milliseconds(0))
+    }
+
+    fn cmd_send_elapsed(&self) -> Option<Milliseconds<u32>> {
+        self.cmd_send_time
+            .as_ref()
+            .and_then(|started| {
+                self.clock
+                    .try_now()
+                    .ok()
+                    .and_then(|now| now.checked_duration_since(started))
+            })
+            .and_then(|dur| dur.try_into().ok())
     }
 }
 
-impl<Tx, T, BufLen, ComCapacity, ResCapacity, UrcCapacity> AtatClient
-    for Client<Tx, T, BufLen, ComCapacity, ResCapacity, UrcCapacity>
+impl<Tx, CLK, BufLen, ComCapacity, ResCapacity, UrcCapacity> AtatClient
+    for Client<Tx, CLK, BufLen, ComCapacity, ResCapacity, UrcCapacity>
 where
     Tx: serial::Write<u8>,
-    T: CountDown,
-    T::Time: From<u32>,
+    CLK: Clock,
+    Generic<CLK::T>: TryInto<Milliseconds>,
     BufLen: ArrayLength<u8>,
     ComCapacity: ArrayLength<ComItem>,
     ResCapacity: ArrayLength<ResItem<BufLen>>,
@@ -110,7 +155,7 @@ where
             // compare the time of the last response or URC and ensure at least
             // `self.config.cmd_cooldown` ms have passed before sending a new
             // command
-            nb::block!(self.timer.try_wait()).ok();
+            while self.last_receive_elapsed() < self.config.cmd_cooldown {}
             let cmd_buf = cmd.as_bytes();
 
             match core::str::from_utf8(&cmd_buf) {
@@ -136,22 +181,21 @@ where
                 nb::block!(self.tx.try_write(c)).map_err(|_e| Error::Write)?;
             }
             nb::block!(self.tx.try_flush()).map_err(|_e| Error::Write)?;
+            self.set_cmd_send_time()?;
+
             self.state = ClientState::AwaitingResponse;
         }
 
         match self.config.mode {
             Mode::Blocking => Ok(nb::block!(self.check_response(cmd))?),
             Mode::NonBlocking => self.check_response(cmd),
-            Mode::Timeout => {
-                self.timer.try_start(cmd.max_timeout_ms()).ok();
-                Ok(nb::block!(self.check_response(cmd))?)
-            }
+            Mode::Timeout => Ok(nb::block!(self.check_response(cmd))?),
         }
     }
 
     fn peek_urc_with<URC: AtatUrc, F: FnOnce(URC::Response) -> bool>(&mut self, f: F) {
         if let Some(urc) = self.urc_c.peek() {
-            self.timer.try_start(self.config.cmd_cooldown).ok();
+            self.last_receive_time = self.clock.try_now().unwrap();
             if let Ok(urc) = URC::parse(urc) {
                 if !f(urc) {
                     return;
@@ -166,7 +210,7 @@ where
             return match result {
                 Ok(ref resp) => {
                     if let ClientState::AwaitingResponse = self.state {
-                        self.timer.try_start(self.config.cmd_cooldown).ok();
+                        self.set_last_receive_time()?;
                         self.state = ClientState::Idle;
                         Ok(cmd.parse(resp).map_err(nb::Error::Other)?)
                     } else {
@@ -174,20 +218,23 @@ where
                     }
                 }
                 Err(e) => {
-                    self.timer.try_start(self.config.cmd_cooldown).ok();
+                    self.set_last_receive_time()?;
                     self.state = ClientState::Idle;
                     Err(nb::Error::Other(e))
                 }
             };
         } else if let Mode::Timeout = self.config.mode {
-            if self.timer.try_wait().is_ok() {
-                self.state = ClientState::Idle;
-                // Tell the parser to clear the buffer due to timeout
-                if self.com_p.enqueue(Command::ClearBuffer).is_err() {
-                    // TODO: Consider how to act in this situation.
-                    atat_log!(error, "Failed to signal parser to clear buffer on timeout!");
+            match self.cmd_send_elapsed() {
+                Some(elapsed) if elapsed >= Milliseconds::<u32>(cmd.max_timeout_ms()) => {
+                    self.state = ClientState::Idle;
+                    // Tell the parser to clear the buffer due to timeout
+                    if self.com_p.enqueue(Command::ClearBuffer).is_err() {
+                        // TODO: Consider how to act in this situation.
+                        atat_log!(error, "Failed to signal parser to clear buffer on timeout!");
+                    }
+                    return Err(nb::Error::Other(Error::Timeout));
                 }
-                return Err(nb::Error::Other(Error::Timeout));
+                _ => {}
             }
         }
         Err(nb::Error::WouldBlock)
@@ -208,21 +255,18 @@ mod test {
     use nb;
 
     struct CdMock {
-        time: u32,
+        time: core::cell::Cell<u32>,
     }
 
-    impl CountDown for CdMock {
-        type Error = core::convert::Infallible;
-        type Time = u32;
-        fn try_start<T>(&mut self, count: T) -> Result<(), Self::Error>
-        where
-            T: Into<Self::Time>,
-        {
-            self.time = count.into();
-            Ok(())
-        }
-        fn try_wait(&mut self) -> nb::Result<(), Self::Error> {
-            Ok(())
+    impl Clock for CdMock {
+        type T = u32;
+
+        const SCALING_FACTOR: Fraction = Fraction::new(1, 1);
+
+        fn try_now(&self) -> Result<Instant<Self>, embedded_time::clock::Error> {
+            let new_time = self.time.get() + 1;
+            self.time.set(new_time);
+            Ok(Instant::new(new_time))
         }
     }
 
@@ -377,7 +421,9 @@ mod test {
             static mut COM_Q: queues::ComQueue<TestComCapacity> = Queue(heapless::i::Queue::u8());
             let (com_p, _com_c) = unsafe { COM_Q.split() };
 
-            let timer = CdMock { time: 0 };
+            let timer = CdMock {
+                time: core::cell::Cell::new(0),
+            };
 
             let tx_mock = TxMock::new(String::new());
             let client: Client<
